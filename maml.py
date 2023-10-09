@@ -23,16 +23,16 @@ def get_network_fn(num_outputs: int):
     
     def network_fn(obs: chex.Array) -> chex.Array:
         x = hk.Sequential([
-            hk.Linear(64),
+            hk.Linear(128),
             jax.nn.relu])(obs)
 
         logits = hk.Sequential([
-            hk.Linear(64), 
+            hk.Linear(128), 
             jax.nn.relu,
             hk.Linear(num_outputs)])(x)
         
         value = hk.Sequential([
-            hk.Linear(64), 
+            hk.Linear(128), 
             jax.nn.relu,
             hk.Linear(1)])(x)
 
@@ -41,7 +41,7 @@ def get_network_fn(num_outputs: int):
     return hk.without_apply_rng(hk.transform(network_fn))
 
 def mutate_env_params(env_params : EnvParams, rng : chex.PRNGKey):
-    """Mutates the parameters of the environment."""
+    """Mutates the parameters of the environment. Can be seen as a new Task."""
     keys = jax.random.split(rng, 8)
     noise_scale = 0.0
     return env_params.replace(  gravity = 9.8 + jax.random.uniform(keys[0], minval=-noise_scale, maxval=noise_scale),
@@ -53,22 +53,18 @@ def mutate_env_params(env_params : EnvParams, rng : chex.PRNGKey):
                                 force_mag = 10.0 + jax.random.uniform(keys[0], minval=-noise_scale, maxval=noise_scale),
                                 tau = 0.02 + jax.random.uniform(keys[0], minval=-noise_scale, maxval=noise_scale))
 
-def broadcast_to_shape(x : Any, shape : chex.Shape):
-    """Broadcasts x to the shape specified."""
-    broadcast = lambda x: jnp.broadcast_to(x, shape + x.shape)
-    return jax.tree_map(broadcast, x)
-
 def sample_tasks(base_env_params : EnvParams, rng_key, num_tasks):
+    """Samples multiple tasks from the base environment params."""
     tasks_env_params = jax.vmap(mutate_env_params, in_axes=(None, 0))(base_env_params, jax.random.split(rng_key, num_tasks))  # mutate env_params.
     return tasks_env_params
 
 
 def get_meta_learner_fn(
     env : Environment, init_env_params : EnvParams, network_fn, opt_update_fn, rollout_len, agent_discount, iterations, gae_lambda, clip_epsilon, inner_loop_burn_in, num_trajectories, num_tasks):
-    """Returns a learner function that can be used to train the parameters of the agent."""
+    """Returns a meta-learner function that can be used to meta-train the parameters of the agent."""
 
     def rollout_fn(params, outer_rng, env_state, init_obs, env_params):
-        """Collects a single trajectory from the environment."""
+        """Performs an environment rollout."""
 
         def step_fn(carry, rng):
             """A single step of the environment."""
@@ -93,7 +89,7 @@ def get_meta_learner_fn(
         return rollout, env_state, o_t
     
     def sample_trajectory(params, rng_key, env_params):
-        """Samples a single trajectory from the environment."""
+        """Resets the environment and collects a single trajectory from the environment."""
         rng_key, rollout_rng = jax.random.split(rng_key)
         obs, env_state = env.reset(rng_key, env_params)
         rollout, _, _ = rollout_fn(params, rollout_rng, env_state, obs, env_params)
@@ -116,6 +112,7 @@ def get_meta_learner_fn(
         return loss
     
     def inner_policy_update_fn(inner_params : hk.Params, inner_opt_state : optax.OptState, rng_key : chex.PRNGKey, env_params : EnvParams):
+        """Updates the parameters of the agent on a single task."""
         trajectory_keys = jax.random.split(rng_key, num_trajectories)
         rollout = jax.vmap(sample_trajectory, in_axes=(None, 0, None))(inner_params, trajectory_keys, env_params)
         batch_loss = jax.vmap(inner_policy_loss_fn, in_axes=(None, 0))
@@ -129,6 +126,7 @@ def get_meta_learner_fn(
 
 
     def inner_loop_fn(meta_params : hk.Params, meta_opt_state : optax.OptState, rng_key : chex.PRNGKey, env_params):
+        """Inner loop of maml - performs policy updates and returns the loss."""
         
         rng_key, burn_in_rng, update_rng = jax.random.split(rng_key, 3)
 
@@ -147,12 +145,13 @@ def get_meta_learner_fn(
         return loss
     
     def meta_loss(meta_params, meta_train_state, inner_loop_key, task_env_params):
+            """Computes the meta-loss."""
             outer_loss = jax.vmap(inner_loop_fn, in_axes=(None, None, 0, 0))(meta_params, meta_train_state, jax.random.split(inner_loop_key, num_tasks), task_env_params)
             outer_loss = jnp.mean(outer_loss)
             return outer_loss
         
     def outer_fn(meta_params : hk.Params, meta_opt_state : optax.OptState, rng_key : chex.PRNGKey):
-
+        """Performs a single update of the meta-parameters."""
         rng_key, mutation_key, inner_loop_key = jax.random.split(rng_key, 3)
         task_env_params = sample_tasks(init_env_params, mutation_key, num_tasks)
         
@@ -177,6 +176,7 @@ def get_meta_learner_fn(
     return meta_learner_fn
 
 def setup_experiment(seed, learning_rate):
+    """Sets up the experiment."""
 
     key = jax.random.PRNGKey(seed)
     key, net_key = jax.random.split(key, 2)
@@ -188,7 +188,7 @@ def setup_experiment(seed, learning_rate):
 
     meta_params = network_fn.init(net_key, jnp.expand_dims(dummy_obs, 0))
 
-    opt_update_fn = optax.sgd(learning_rate)
+    opt_update_fn = optax.sgd(learning_rate, momentum=0.9)
 
     meta_opt_state = opt_update_fn.init(meta_params)
 
@@ -200,8 +200,8 @@ meta_params, meta_opt_state, env, init_env_params, network_fn, opt_update_fn, ke
 @jax.jit
 def eval_one_episode(params, rng, env_params):
     """Evaluates the agent on a single episode."""
-    
-    o_tm1, state = env.reset(rng, env_params)
+    rng, reset_key = jax.random.split(rng)
+    o_tm1, state = env.reset(reset_key, env_params)
     
     def step(val):
         params, state, o_tm1, tot_r, rng, _ = val
@@ -217,9 +217,12 @@ def eval_one_episode(params, rng, env_params):
     return params, tot_r
 
 
-reward = eval_one_episode(meta_params, key, init_env_params)[-1]
+key, eval_key = jax.random.split(key)
 
-print("Before Training Reward: ", reward)
+eval_keys = jax.random.split(eval_key, 100)
+tot_reward = jax.vmap(eval_one_episode, in_axes=(None, 0, None))(meta_params, eval_keys, init_env_params)[-1]
+
+print("Before Training Reward: ", jnp.mean(tot_reward))
 
 meta_learn_fn = get_meta_learner_fn(env,
                                     init_env_params, 
@@ -236,13 +239,15 @@ meta_learn_fn = get_meta_learner_fn(env,
 
 meta_learn_fn = jax.jit(meta_learn_fn)
 
-meta_training_steps = 100
+meta_training_steps = 5
 print("Meta-learning...")
 
 for i in range(meta_training_steps):
     meta_params, meta_opt_state, meta_loss = meta_learn_fn(meta_params, meta_opt_state, key)
     print("Meta Loss: ", meta_loss)
 
-reward = eval_one_episode(meta_params, key, init_env_params)[-1]
+key, eval_key = jax.random.split(key)
+eval_keys = jax.random.split(eval_key, 100)
+tot_reward = jax.vmap(eval_one_episode, in_axes=(None, 0, None))(meta_params, eval_keys, init_env_params)[-1]
 
-print("After Training Reward: ", reward)
+print("After Training Reward: ", jnp.mean(tot_reward))
