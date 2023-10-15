@@ -41,7 +41,7 @@ def get_network_fn(num_outputs: int):
 
 
 def mutate_env_params(env_params: EnvParams, rng: chex.PRNGKey):
-    """Mutates the parameters of the environment. Can be seen as a new Task."""
+    """Mutates the parameters of the environment. Can be seen as a new Task. Very much a toy implementation."""
     keys = jax.random.split(rng, 8)
     noise_scale = 0.5
     return env_params.replace(
@@ -140,7 +140,7 @@ def get_meta_learner_fn(
         return rollout
 
     def inner_policy_loss_fn(params: hk.Params, batch: TimeStep):
-        """Computes the loss of the agent on a single trajectory."""
+        """Computes the ppo-loss of the agent on a single trajectory."""
         batch = jax.tree_map(lambda x: jnp.squeeze(x, 0), batch)
         logits_t, v_t = network_fn.apply(params, batch.observation)
         a_log_prob_t = distrax.Categorical(logits_t).log_prob(
